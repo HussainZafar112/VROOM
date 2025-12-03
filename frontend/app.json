@@ -13,7 +13,13 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "VROOM needs Bluetooth access to connect to your car's OBD-II adapter.",
+        "NSBluetoothPeripheralUsageDescription": "VROOM uses Bluetooth to read real-time diagnostics data from your vehicle.",
+        "NSLocationWhenInUseUsageDescription": "Location services are required to scan for Bluetooth devices on this operating system."
+      },
+      "bundleIdentifier": "com.aneeb02.vroomprototype"
     },
     "android": {
       "permissions": [
@@ -34,7 +40,7 @@
       }
     },
     "plugins": [
-      "expo-web-browser"
+      "react-native-ble-plx"
     ]
   }
 }
