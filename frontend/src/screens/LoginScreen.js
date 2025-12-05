@@ -3,6 +3,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { View, Text, StyleSheet, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform } from "react-native";
 import { AuthContext } from "../navigation/AuthContext"; 
 import * as Google from "expo-auth-session/providers/google";
+import { BASE } from "../navigation/api";  // correct relative path
 
 // Helper function to replace alert() with console log messages
 const showMessage = (message) => {
@@ -18,17 +19,17 @@ export default function LoginScreen({ navigation }) {
 
     const handleLogin = async () => {
         try {
-            const res = await fetch("http://192.168.18.5:8000/auth/login", {
+            const res = await fetch(`${BASE}/auth/login`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ email, password }),
             });
-
             const data = await res.json();
 
             if (res.ok && data.session) {
                 // fetch full user profile after successful login
-                const userRes = await fetch(`http://192.168.18.5:8000/auth/user/${data.session.user_id}`);
+                
+                const userRes = await fetch(`${BASE}/auth/user/${data.session.user_id}`);
                 const userData = await userRes.json();
 
                 await login({

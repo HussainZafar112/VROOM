@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, TextInput, TouchableOpacity, KeyboardAvoidingVi
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { AuthContext } from "../navigation/AuthContext"; //  import the context
 import * as Google from "expo-auth-session/providers/google";
+import { BASE } from "../navigation/api"; 
 export default function SignupScreen({ navigation }) {
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
@@ -18,7 +19,7 @@ export default function SignupScreen({ navigation }) {
     }
 
     try {
-      const res = await fetch("http://192.168.18.5:8000/auth/signup", {
+      const res = await fetch(`${BASE}/auth/signup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

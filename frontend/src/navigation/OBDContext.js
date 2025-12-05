@@ -1,310 +1,273 @@
-import React, { createContext, useState, useEffect, useCallback, useMemo } from 'react';
-// IMPORTANT: This library requires the Expo BARE Workflow or Development Builds, 
-// and will NOT work in the standard Expo Go app.
-import { BleManager } from 'react-native-ble-plx'; 
-import { Buffer } from 'buffer'; // Often required for correct Base64/ASCII conversion in React Native
-
-// Common UUIDs for ELM327 over BLE
-const OBD_SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb'; 
-const OBD_CHARACTERISTIC_UUID = '0000ffe1-0000-1000-8000-00805f9b34fb'; 
-
-// Utility functions for data conversion
-const stringToBase64 = (str) => Buffer.from(str, 'ascii').toString('base64');
-const base64ToString = (base64) => Buffer.from(base64, 'base64').toString('ascii');
-
-const manager = new BleManager(); 
+import React, { createContext, useState, useRef, useEffect, useCallback } from 'react';
+import { BleManager } from 'react-native-ble-plx';
+import base64 from 'react-native-base64'; 
+import { Buffer } from 'buffer'; 
 
 export const OBDContext = createContext();
 
-export const OBDProvider = ({ children }) => {
+export function OBDProvider({ children }) {
+    const manager = useRef(new BleManager()).current;
+
+    // State
     const [isConnected, setIsConnected] = useState(false);
     const [isScanning, setIsScanning] = useState(false);
     const [device, setDevice] = useState(null);
     const [scannedDevices, setScannedDevices] = useState({});
-    const [obdData, setObdData] = useState({}); // Stores processed data (e.g., {RPM: 1500, Temp: 90})
-    const [log, setLog] = useState([]); // Connection/Command log
+    const [log, setLog] = useState([]);
 
-    // Helper to log messages
-    const logMessage = (msg) => {
-        const timestampedMsg = `${new Date().toLocaleTimeString()} - ${msg}`;
-        setLog(prev => [...prev.slice(-49), timestampedMsg]); // Keep the last 50 logs
-        console.log(`[OBD LOG] ${timestampedMsg}`);
-    };
+    // Connection Stability Refs
+    const isConnecting = useRef(false);
     
-    // --- Data Interpretation Logic ---
+    // Dynamic UUID & Capability Refs (Populated upon connection)
+    const activeServiceUUID = useRef(null);
+    const activeCharacteristicUUID = useRef(null);
+    const canWriteWithoutResponse = useRef(false);
+    const canWriteWithResponse = useRef(false);
+    const canNotify = useRef(false);
 
-    /**
-     * Converts raw ELM327 hexadecimal response string into meaningful data.
-     * @param {string} rawHex - E.g., '41 0C 15 B8\r\r>'
-     * @returns {object|null} { key: 'RPM', value: 1390 }
-     */
-    const processElmResponse = useCallback((rawHex) => {
-        // Clean up the response from the adapter (remove prompt characters like '>' and carriage returns)
-        const cleanedResponse = rawHex.trim().replace(/>/g, '').replace(/\r/g, '').toUpperCase();
-        const parts = cleanedResponse.split(/\s+/).filter(p => p.length > 0);
-
-        if (parts.length < 2) {
-             // Handle simple responses like 'OK', 'NO DATA', 'SEARCHING...'
-            if (cleanedResponse === 'OK' || cleanedResponse.includes('SEARCHING')) return { key: 'STATUS', value: cleanedResponse };
-            if (cleanedResponse.includes('NO DATA')) return { key: 'ERROR', value: 'NO DATA' };
-            return null;
-        }
-
-        // Standard Mode 01 response starts with 41 (40h + 1h mode)
-        if (parts[0] === '41') { 
-            const pid = parts[1]; // The PID (e.g., 0C)
-            
-            // PID 0C: Engine RPM (A, B) -> Formula: ((256 * A) + B) / 4
-            if (pid === '0C' && parts.length >= 4) {
-                const A = parseInt(parts[2], 16);
-                const B = parseInt(parts[3], 16);
-                const rpm = ((256 * A) + B) / 4;
-                return { key: 'RPM', value: rpm };
-            }
-
-            // PID 05: Engine Coolant Temperature (A) -> Formula: A - 40
-            if (pid === '05' && parts.length >= 3) {
-                const A = parseInt(parts[2], 16);
-                const tempC = A - 40;
-                return { key: 'CoolantTemp', value: tempC };
-            }
-
-            // PID 0D: Vehicle Speed (A) -> Formula: A
-            if (pid === '0D' && parts.length >= 3) {
-                const speed = parseInt(parts[2], 16);
-                return { key: 'SpeedKmH', value: speed };
-            }
-            // Add more PIDs and their decoding formulas here...
-        }
-        
-        // Mode 03 response for DTCs (Diagnostic Trouble Codes)
-        if (parts[0] === '43') { // 40h + 3h mode
-            // DTC response logic is complex, involving decoding groups of 2 bytes.
-            // For now, return the raw DTC data for later processing
-            return { key: 'RAW_DTC', value: parts.slice(1).join(' ') };
-        }
-
-        return null; 
+    const addLog = useCallback((msg) => {
+        const timestampedMsg = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        setLog(prev => [...prev.slice(-49), timestampedMsg]);
+        console.log('[OBD LOG]', timestampedMsg);
     }, []);
 
-    // --- OBD Interaction ---
-    
-    /**
-     * Sends a raw command to the OBD adapter and reads the response.
-     * @param {string} command - The raw ELM327 command, e.g., '010C' or 'AT Z'.
-     */
-    const sendCommand = useCallback(async (command, serviceUuid = OBD_SERVICE_UUID, characteristicUuid = OBD_CHARACTERISTIC_UUID) => {
-        if (!device || !isConnected) {
-            logMessage("Error: Not connected to OBD device.");
-            return null;
-        }
-
-        try {
-            // ELM327 commands often need a Carriage Return (\r) to execute
-            const elmCommand = command + '\r'; 
-            const base64Command = stringToBase64(elmCommand);
-            
-            logMessage(`Sending command: ${command}`);
-
-            // 1. Write the command
-            await device.writeCharacteristicWithResponseForService(
-                serviceUuid, 
-                characteristicUuid, 
-                base64Command
-            );
-
-            // 2. Read the response
-            const readCharacteristic = await device.readCharacteristicForService(
-                serviceUuid, 
-                characteristicUuid
-            );
-
-            const rawResponse = base64ToString(readCharacteristic.value).trim();
-            
-            // 3. Process the response
-            const processed = processElmResponse(rawResponse);
-            
-            if (processed && processed.key && processed.value !== undefined) {
-                if (processed.key !== 'STATUS' && processed.key !== 'ERROR') {
-                    setObdData(prev => ({ ...prev, [processed.key]: processed.value }));
+    // --- Utility to handle unexpected disconnects ---
+    useEffect(() => {
+        if (device) {
+            const subscription = device.onDisconnected((error) => {
+                if (error) {
+                    addLog(`Device disconnected unexpectedly: ${error.message}`);
+                } else {
+                    addLog('Device disconnected.');
                 }
-                logMessage(`Data processed: ${processed.key} = ${processed.value}`);
-            } else {
-                logMessage(`Received raw: ${rawResponse}`);
-            }
-
-            return rawResponse;
-
-        } catch (error) {
-            logMessage(`Command ${command} FAILED: ${error.message}`);
-            return null;
+                setIsConnected(false);
+                setDevice(null);
+                isConnecting.current = false;
+                
+                // Reset refs
+                activeServiceUUID.current = null;
+                activeCharacteristicUUID.current = null;
+            });
+            return () => subscription.remove();
         }
-    }, [device, isConnected, logMessage, processElmResponse]);
+    }, [device, addLog]);
 
-    // Simple loop to request common PIDs periodically for real-time data
-    const startDataStream = useCallback((connectedDevice) => {
-        if (!connectedDevice) return () => {};
+    // -------------------------
+    // Scan for devices
+    // -------------------------
+    const scanForDevices = async (stop = false) => {
+        if (stop) {
+            manager.stopDeviceScan();
+            setIsScanning(false);
+            addLog('Scan stopped.');
+            return;
+        }
 
-        // Commands to initialize the ELM327 chip (essential steps)
-        const initializationCommands = [
-            'AT Z',    // Reset ELM device
-            'AT E0',   // Echo Off
-            'AT L0',   // Linefeeds Off
-            'AT S0',   // Spaces Off
-            'AT SP 0', // Set protocol to Auto
-        ];
-
-        // Ensure initialization happens before starting the data loop
-        const initialize = async () => {
-            logMessage("Starting ELM327 Initialization Sequence...");
-            for (const cmd of initializationCommands) {
-                await sendCommand(cmd);
-                await new Promise(resolve => setTimeout(resolve, 100)); // Wait for device readiness
-            }
-            logMessage("Initialization complete. Starting data stream.");
-        };
-
-        initialize();
-
-        // PIDs to continuously monitor
-        const pids = ['010C', '010D', '0105']; // RPM, Speed, Temp
-
-        const intervalId = setInterval(() => {
-            // Cycle through PIDs sequentially
-            const nextPid = pids[Math.floor(Math.random() * pids.length)];
-            sendCommand(nextPid);
-        }, 500); // Poll every 500ms for continuous updates
-
-        // Return the cleanup function
-        return () => clearInterval(intervalId);
-    }, [sendCommand, logMessage]);
-
-
-    // --- Bluetooth Management ---
-
-    const scanForDevices = () => {
-        if (isScanning) return;
-        setScannedDevices({});
         setIsScanning(true);
-        logMessage("Starting device scan...");
-        
-        // Request Permissions before scanning (mandatory on Android/iOS)
-        // Note: You must handle permission requests for Bluetooth/Location in your main app component
-        // or a dedicated permissions utility, as the manager alone doesn't grant them.
+        addLog('Scanning for BLE OBD devices...');
+        setScannedDevices({});
 
-        manager.startDeviceScan(null, { allowDuplicates: false }, (error, scannedDevice) => {
+        manager.startDeviceScan(null, null, (error, dev) => {
             if (error) {
-                logMessage(`Scanning error: ${error.message}`);
+                addLog(`Scan error: ${error}`);
                 setIsScanning(false);
                 return;
             }
-            
-            // Filter devices by name (ELM, OBD, or similar)
-            if (scannedDevice.name && (scannedDevice.name.toUpperCase().includes('OBD') || scannedDevice.name.toUpperCase().includes('ELM') || scannedDevice.serviceUUIDs?.includes(OBD_SERVICE_UUID))) {
-                setScannedDevices(prev => ({ ...prev, [scannedDevice.id]: scannedDevice }));
+
+            if (dev && dev.id) {
+                setScannedDevices(prev => {
+                    if (!prev[dev.id]) {
+                        addLog(`Found device: ${dev.name || 'N/A'} (${dev.id})`);
+                    }
+                    return { ...prev, [dev.id]: dev };
+                });
             }
         });
 
-        // Stop scanning after 15 seconds
         setTimeout(() => {
             manager.stopDeviceScan();
             setIsScanning(false);
-            logMessage(`Scan stopped. Found ${Object.keys(scannedDevices).length} devices.`);
-        }, 15000);
+            addLog('Scan finished.');
+        }, 10000); 
     };
 
-    const connectToDevice = async (deviceToConnect) => {
+    // -------------------------
+    // HELPER: Auto-Detect OBD Characteristics
+    // -------------------------
+    const findWritableCharacteristic = async (connectedDevice) => {
+        try {
+            const servicesObj = await connectedDevice.services();
+            const services = Object.values(servicesObj); // Array of Service objects
+            
+            for (const service of services) {
+                const characteristics = await connectedDevice.characteristicsForService(service.uuid);
+                
+                for (const char of characteristics) {
+                    // Check for Write capabilities
+                    if (char.isWritableWithoutResponse) {
+                        addLog(`Found WriteNoResp Char: ${char.uuid}`);
+                        activeServiceUUID.current = service.uuid;
+                        activeCharacteristicUUID.current = char.uuid;
+                        canWriteWithoutResponse.current = true;
+                        canWriteWithResponse.current = false;
+                        return true;
+                    }
+                    
+                    if (char.isWritableWithResponse) {
+                        addLog(`Found WriteResp Char: ${char.uuid}`);
+                        activeServiceUUID.current = service.uuid;
+                        activeCharacteristicUUID.current = char.uuid;
+                        canWriteWithResponse.current = true;
+                        canWriteWithoutResponse.current = false;
+                        return true;
+                    }
+                }
+            }
+        } catch (e) {
+            addLog(`Error finding characteristics: ${e.message}`);
+        }
+        return false;
+    };
+    
+    // -------------------------
+    // Execute synchronous ELM327 command
+    // -------------------------
+    const executeElmCommand = async (command, targetDevice = null) => {
+        const currentDevice = targetDevice || device;
+        if (!currentDevice) {
+            addLog(`Error: Cannot send ${command}. No device reference.`);
+            return null;
+        }
+        
+        if (!activeServiceUUID.current || !activeCharacteristicUUID.current) {
+             addLog(`Error: No writable characteristic detected.`);
+             return null;
+        }
+
+        const elmCommand = command + '\r'; 
+        const base64Command = base64.encode(elmCommand);
+        
+        const MAX_RETRIES = 2;
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                addLog(`Sending ${command} (Att ${attempt})...`);
+
+                // 1. Write based on detected capability
+                if (canWriteWithoutResponse.current) {
+                    await currentDevice.writeCharacteristicWithoutResponseForService(
+                        activeServiceUUID.current,
+                        activeCharacteristicUUID.current,
+                        base64Command
+                    );
+                } else {
+                     await currentDevice.writeCharacteristicWithResponseForService(
+                        activeServiceUUID.current,
+                        activeCharacteristicUUID.current,
+                        base64Command
+                    );
+                }
+                
+                // 2. Wait for processing (ELM327 needs time)
+                await new Promise(resolve => setTimeout(resolve, 300)); 
+
+                // 3. Read response
+                const readCharacteristic = await currentDevice.readCharacteristicForService(
+                    activeServiceUUID.current, 
+                    activeCharacteristicUUID.current
+                );
+                
+                const rawResponse = base64.decode(readCharacteristic.value).trim();
+                addLog(`Response: ${rawResponse}`);
+                
+                return rawResponse; 
+
+            } catch (error) {
+                addLog(`CMD Failed: ${error.message}`);
+                if (attempt === MAX_RETRIES) return null;
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+        }
+        return null;
+    };
+
+    // -------------------------
+    // Connect to device
+    // -------------------------
+    const connectToDevice = async (dev) => {
+        if (!dev) return;
+        if (isConnecting.current) return;
+
         manager.stopDeviceScan(); 
         setIsScanning(false);
+        isConnecting.current = true;
+        addLog(`Connecting to ${dev.name || dev.id}...`);
 
         try {
-            logMessage(`Attempting connection to ${deviceToConnect.name || 'Unknown Device'}...`);
-            const connectedDevice = await deviceToConnect.connect();
-            await connectedDevice.discoverAllServicesAndCharacteristics();
-            await connectedDevice.requestMTU(256); // Optimize data throughput
+            // 1. Connect
+            const connectedDevice = await dev.connect();
             
+            // 2. Discover & Request MTU
+            await connectedDevice.discoverAllServicesAndCharacteristics();
+            try { await connectedDevice.requestMTU(512); } catch(e) {}
+            
+            await new Promise(resolve => setTimeout(resolve, 1000)); 
+
+            // 3. Auto-Detect Services (CRITICAL FIX)
+            const found = await findWritableCharacteristic(connectedDevice);
+            
+            if (!found) {
+                throw new Error("No writable OBD characteristic found on this device.");
+            }
+
+            // 4. Set state
             setDevice(connectedDevice);
             setIsConnected(true);
-            logMessage(`Successfully connected to ${connectedDevice.name}.`);
-
-            // Start the data streaming loop
-            const cleanupStream = startDataStream(connectedDevice);
+            addLog(`Connected! UUID: ${activeCharacteristicUUID.current}`);
             
-            // Add a listener to handle unexpected disconnects
-            const disconnectListener = connectedDevice.onDisconnected((error, disconnectedDevice) => {
-                logMessage(`Device disconnected: ${error ? error.message : 'User action'}`);
-                setDevice(null);
-                setIsConnected(false);
-                cleanupStream(); 
-                disconnectListener.remove(); 
-            });
-
-        } catch (error) {
-            logMessage(`Connection failed: ${error.message}`);
-            setIsConnected(false);
-        }
-    };
-    
-    const disconnect = async () => {
-        if (device) {
-            logMessage(`Disconnecting from ${device.name}...`);
-            try {
-                // Cancel connection will trigger the onDisconnected listener which handles cleanup
-                await device.cancelConnection(); 
-            } catch (e) {
-                // If cancellation fails, force state reset
-                logMessage(`Error during disconnection: ${e.message}. Resetting state.`);
-                setIsConnected(false);
-                setDevice(null);
-                setObdData({});
+            // 5. Send ATZ
+            const atzResponse = await executeElmCommand('ATZ', connectedDevice);
+            
+            if (atzResponse && (atzResponse.includes('ELM') || atzResponse.includes('?'))) {
+                addLog('Init Success!');
+                
+                // Config
+                await executeElmCommand('AT E0', connectedDevice);
+                await executeElmCommand('AT L0', connectedDevice);
+                await executeElmCommand('AT SP 0', connectedDevice);
+                
+                isConnecting.current = false;
+            } else {
+                 addLog(`Init Warning. Response: ${atzResponse}`);
+                 // Try one recovery command
+                 await executeElmCommand('AT E0', connectedDevice);
+                 isConnecting.current = false;
             }
-        } else {
+
+        } catch (err) {
+            addLog(`Conn Error: ${err.message}`);
             setIsConnected(false);
             setDevice(null);
-            setObdData({});
+            manager.cancelDeviceConnection(dev.id).catch(() => {});
+            isConnecting.current = false;
         }
     };
-
-    // Initial Bluetooth state check
-    useEffect(() => {
-        let stateSubscription;
-        try {
-            stateSubscription = manager.onStateChange((state) => {
-                if (state === 'PoweredOn') {
-                    logMessage("Bluetooth is ready.");
-                    // Check permissions here if not handled elsewhere
-                } else {
-                    logMessage(`Bluetooth State: ${state}. Please enable Bluetooth.`);
-                }
-            }, true);
-        } catch(e) {
-            logMessage(`Error initializing BLE manager: ${e.message}`);
-        }
-
-        return () => {
-             // Cleanup BleManager instance and subscription when component unmounts
-            if (stateSubscription) stateSubscription.remove();
-            manager.destroy(); 
-        };
-    }, [logMessage]);
     
-    const contextValue = useMemo(() => ({
-        isConnected,
-        isScanning,
-        device,
-        scannedDevices,
-        obdData,
-        log,
-        scanForDevices,
-        connectToDevice,
-        disconnect,
-        sendCommand,
-    }), [isConnected, isScanning, device, scannedDevices, obdData, log, scanForDevices, connectToDevice, disconnect, sendCommand]);
-
+    const sendCommand = async (command) => {
+        return executeElmCommand(command, device);
+    };
 
     return (
-        <OBDContext.Provider value={contextValue}>
+        <OBDContext.Provider value={{
+            scanForDevices,
+            connectToDevice,
+            isConnected,
+            isScanning,
+            device,
+            scannedDevices,
+            log,
+            sendCommand
+        }}>
             {children}
         </OBDContext.Provider>
     );
-};
+}

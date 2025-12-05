@@ -1,7 +1,8 @@
 // api.js
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
-const BASE = "http://192.168.18.5:8000"; // <-- change if your backend host differs
+export const BASE = "https://rickey-planimetric-glimmeringly.ngrok-free.dev";
+
 
 async function getToken() {
   try {
